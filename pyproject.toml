@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rescue_gridworld"
+version = "1.0.1"
+authors = [
+  { name="Andy Edmondson", email="Andy.Edmondson@ed.ac.uk" },
+]
+description = "A procedural gridworld maze requiring completion of temporally extended tasks."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "gymnasium",
+    "numpy",
+    "pygame",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/Levinin/rescue_gridworld_env"
+"Bug Tracker" = "https://github.com/Levinin/rescue_gridworld_env/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rescue_gridworld*"]
