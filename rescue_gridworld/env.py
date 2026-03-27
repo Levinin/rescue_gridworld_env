@@ -1451,8 +1451,8 @@ class RescueGridworldEnv(gym.Env):
         for row in range(window_size - 1, -1, -1):
             for col in range(window_size - 1, -1, -1):
                 if not has_los((r, r), (row, col), window):
-                    window[row, col] = UNKNOWN
-                    window_chains[row, col] = -2
+                    window[row, col] = 100
+                    window_chains[row, col] = -1
 
         return window, window_chains
 
