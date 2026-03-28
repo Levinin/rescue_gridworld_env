@@ -48,4 +48,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     
-    run_random_agent(args.steps, args.episodes, args.render, args.tilesize, args.rooms)
+    run_random_agent(args.steps, args.episodes, args.render, args.tilesize, args.rooms, args.people)

@@ -63,7 +63,7 @@ class RescueGridworldEnv(gym.Env):
         debug_draw_chains: bool = False,
         reset_options: Dict[str, Any] = {},
         stochastic_transition_chance: float = 0.0,
-        obs_window_size: int = 7,
+        obs_window_size: int = 7,       # Must be odd
     ):
         super().__init__()
         assert render_mode in (None, "human", "rgb_array")
@@ -87,6 +87,7 @@ class RescueGridworldEnv(gym.Env):
         self.stochastic_transition_chance = stochastic_transition_chance
 
         self.action_space = spaces.Discrete(9)
+        assert obs_window_size % 2 == 1, "The window size must be an odd number."
         self.obs_window_size = obs_window_size
         self.observation_space = spaces.Dict(
             {
@@ -144,7 +145,6 @@ class RescueGridworldEnv(gym.Env):
             self._seed = seed
         self._generate_level()
         if self.reset_options.get("get_all_chains", False):
-            # print("Getting all chains")
             self.obtain_all_chain_keys_keycards()
 
         obs = self._get_obs()
@@ -152,8 +152,6 @@ class RescueGridworldEnv(gym.Env):
         self.people_following = 0
         self._episode_rewards = 0
         info = self._update_info()
-        # if self.render_mode == "human":
-        #     self.render()
         return obs, info
 
     def step(self, action: int):
@@ -244,7 +242,6 @@ class RescueGridworldEnv(gym.Env):
 
         elif action == UNLOCK_DOOR:
             dpos = self._adjacent_of_type_with_chain_id({DOOR_LOCKED})
-            # dpos = self._adjacent_of_type({DOOR_LOCKED})
             if dpos is not None:
                 dinfo = self.doors.get(dpos)
                 if dinfo and dinfo.locked:
@@ -268,7 +265,6 @@ class RescueGridworldEnv(gym.Env):
                     self.grid[p.pos] = EMPTY
                     self.people_following += 1
                     reward += 5
-                    # print("Found someone.", p.pos)
                     info["action_success"] = True
 
         self._move_people()
@@ -279,8 +275,6 @@ class RescueGridworldEnv(gym.Env):
         if self._step_count >= self.max_steps:
             truncated = True
 
-        # if self.render_mode == "human":
-        #     self.render()
         self._episode_rewards += reward
 
         return self._get_obs(), reward, terminated, truncated, info
@@ -384,7 +378,7 @@ class RescueGridworldEnv(gym.Env):
                 surf.blit(text, (dr.x + 2, dr.y + 2))
 
             # B) Draw planned path: key -> cupboard -> door -> exit (per chain)
-            #    We draw small rectangles along cells in the path using the chain color.
+            #    We draw small rectangles along cells in the path using the chain colour.
             for cid, items in self.chain_plan.items():
                 color = self._color_for_chain(cid)
                 points: List[Tuple[int, int]] = []
