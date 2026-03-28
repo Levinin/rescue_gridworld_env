@@ -5,7 +5,7 @@ import gymnasium as gym
 
 def run_random_agent(num_steps: int, num_episodes: int, render: bool, tile_size: int, rooms: int) -> None:
 
-    env = gym.make("RescueGridworld-v0", render_mode="human", tile_size=tile_size, num_rooms=5)
+    env = gym.make("RescueGridworld-v0", render_mode="human", tile_size=tile_size, num_rooms=rooms, num_people=30, obs_window_size=9)
 
     for episode in range(num_episodes):
         obs, info = env.reset()
@@ -23,10 +23,10 @@ def run_random_agent(num_steps: int, num_episodes: int, render: bool, tile_size:
             
             # The dict obs has 'grid' (uint8) and 'chain_grid' (int16)
             # You can access them like:
-            # grid = obs['grid']
-            # chain_grid = obs['chain_grid']
-            # print(grid)
-            # print(chain_grid)
+            grid = obs['grid']
+            chain_grid = obs['chain_grid']
+            print(grid)
+            print(chain_grid)
 
             if terminated or truncated:
                 print(f"Episode finished after {step + 1} steps. Total Reward: {episode_reward:.2f}")
@@ -42,7 +42,7 @@ if __name__ == "__main__":
     parser.add_argument("--episodes", type=int, default=1, help="Number of episodes to run.")
     parser.add_argument("--render", action="store_true", default=True, help="Whether to render the environment.")
     parser.add_argument("--tilesize", type=int, default=12, help="Tile size when rendering.")
-    parser.add_argument("--rooms", type=int, default=3, help="Number of rooms.")
+    parser.add_argument("--rooms", type=int, default=12, help="Number of rooms.")
 
     args = parser.parse_args()
     

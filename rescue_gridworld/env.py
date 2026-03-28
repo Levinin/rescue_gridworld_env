@@ -63,6 +63,7 @@ class RescueGridworldEnv(gym.Env):
         debug_draw_chains: bool = False,
         reset_options: Dict[str, Any] = {},
         stochastic_transition_chance: float = 0.0,
+        obs_window_size: int = 7,
     ):
         super().__init__()
         assert render_mode in (None, "human", "rgb_array")
@@ -86,10 +87,11 @@ class RescueGridworldEnv(gym.Env):
         self.stochastic_transition_chance = stochastic_transition_chance
 
         self.action_space = spaces.Discrete(9)
+        self.obs_window_size = obs_window_size
         self.observation_space = spaces.Dict(
             {
-                "grid": spaces.Box(low=0, high=255, shape=(1, 7, 7), dtype=np.uint8),
-                "chain_grid": spaces.Box(low=-2, high=500, shape=(1, 7, 7), dtype=np.int16),
+                "grid": spaces.Box(low=0, high=255, shape=(1, obs_window_size, obs_window_size), dtype=np.uint8),
+                "chain_grid": spaces.Box(low=-2, high=np.inf, shape=(1, obs_window_size, obs_window_size), dtype=np.int64),
             }
         )
 
@@ -1328,15 +1330,15 @@ class RescueGridworldEnv(gym.Env):
         self.grid[pos] = DOOR_UNLOCKED
 
     def _create_7x7_observation(self, ay: int, ax: int) -> Tuple[np.ndarray, np.ndarray]:
-        window_size = 7
+        window_size = self.obs_window_size
         r = window_size // 2
         H, W = self.grid.shape
 
         # Default unseen = UNKNOWN (255) for tiles, -2 for chain_ids
         window = np.full((window_size, window_size), UNKNOWN, dtype=np.uint8)
-        window_chains = np.full((window_size, window_size), -2, dtype=np.int16)
+        window_chains = np.full((window_size, window_size), -2, dtype=np.int64)
         subgrid = np.full((window_size, window_size), WALL, dtype=np.uint8)
-        subgrid_chains = np.full((window_size, window_size), -1, dtype=np.int16)
+        subgrid_chains = np.full((window_size, window_size), -1, dtype=np.int64)
 
         y0 = max(0, ay - r)
         y1 = min(H, ay + r + 1)
@@ -1345,8 +1347,8 @@ class RescueGridworldEnv(gym.Env):
 
         dy = ay - y0
         dx = ax - x0
-        w_start_y = 0 + (3 - dy)
-        w_start_x = 0 + (3 - dx)
+        w_start_y = 0 + (r - dy)
+        w_start_x = 0 + (r - dx)
         w_size_y = y1 - y0
         w_size_x = x1 - x0
 
@@ -1457,11 +1459,11 @@ class RescueGridworldEnv(gym.Env):
         return window, window_chains
 
     def _get_obs(self):
-        ppl_pos = np.zeros((self.num_people, 2), dtype=np.int16)
+        ppl_pos = np.zeros((self.num_people, 2), dtype=np.int64)
         ppl_follow = np.zeros((self.num_people,), dtype=np.int8)
         ppl_resc = np.zeros((self.num_people,), dtype=np.int8)
         for i, p in enumerate(self.people):
-            ppl_pos[i] = np.array([p.pos[0], p.pos[1]], dtype=np.int16)
+            ppl_pos[i] = np.array([p.pos[0], p.pos[1]], dtype=np.int64)
             ppl_follow[i] = 1 if p.following else 0
             ppl_resc[i] = 1 if p.rescued else 0
         ay, ax = self.agent_pos
@@ -1469,6 +1471,6 @@ class RescueGridworldEnv(gym.Env):
 
         obs = {
             "grid": np.expand_dims(window, axis=0).astype(np.uint8).copy(),
-            "chain_grid": np.expand_dims(window_chains, axis=0).astype(np.int16).copy(),
+            "chain_grid": np.expand_dims(window_chains, axis=0).astype(np.int64).copy(),
         }
         return obs
