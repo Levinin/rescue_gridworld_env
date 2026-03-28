@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rescue_gridworld"
-version = "1.0.3"
+version = "1.0.4"
 authors = [
   { name="Andy Edmondson", email="Andy.Edmondson@ed.ac.uk" },
 ]
