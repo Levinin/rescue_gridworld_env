@@ -138,6 +138,9 @@ class RescueGridworldEnv(gym.Env):
         self._font_small = None  # lazy-init in render
         self.passable_tiles = [EMPTY, KEY_TILE, PERSON_TILE, DOOR_UNLOCKED, EXIT]
 
+        self._passable_tiles_set = {EMPTY, KEY_TILE, PERSON_TILE, DOOR_UNLOCKED, EXIT}
+        self._los_paths = self._precompute_los_paths(self.obs_window_size)
+
     # --------------- Gym API ---------------
     def reset(self, *, seed: Optional[int] = None, options: Dict[str, Any] | None = {}):
         if seed is not None:
@@ -470,6 +473,17 @@ class RescueGridworldEnv(gym.Env):
                 self.inventory["key_ids"].add(cup_info.chain_id)
                 self.inventory["keycard_ids"].add(cup_info.chain_id)
 
+    def _get_empty_adjacent_squares(self, p: Person) -> Tuple[int, int]:
+        r, c = p.pos
+
+        # Define the 4 possible adjacent coordinates
+        candidates = ((r, c + 1), (r, c - 1), (r + 1, c), (r - 1, c))
+
+        # Filter valid positions using a comprehension
+        valid_moves = [pos for pos in candidates if self.grid[pos] == EMPTY]
+
+        return random.choice(valid_moves) if valid_moves else p.pos
+
     # PRIVATE METHODS
     def _move_people(self) -> None:
         self._person_move_step_count = self._person_move_step(
@@ -478,24 +492,24 @@ class RescueGridworldEnv(gym.Env):
         if self._person_move_step_count != 0:  # Only move once per cycle.
             return
 
-        def get_empty_adjacent_squares(p: Person) -> Tuple[int, int]:
-            adj = []
-            if self.grid[p.pos[0], p.pos[1] + 1] == EMPTY:
-                adj.append((p.pos[0], p.pos[1] + 1))
-            if self.grid[p.pos[0], p.pos[1] - 1] == EMPTY:
-                adj.append((p.pos[0], p.pos[1] - 1))
-            if self.grid[p.pos[0] + 1, p.pos[1]] == EMPTY:
-                adj.append((p.pos[0] + 1, p.pos[1]))
-            if self.grid[p.pos[0] - 1, p.pos[1]] == EMPTY:
-                adj.append((p.pos[0] - 1, p.pos[1]))
-            if len(adj) == 0:  # Just in case there are no adjacent empty locations.
-                adj.append((p.pos[0], p.pos[1]))
-            return random.choice(adj)
+        # def get_empty_adjacent_squares(p: Person) -> Tuple[int, int]:
+        #     adj = []
+        #     if self.grid[p.pos[0], p.pos[1] + 1] == EMPTY:
+        #         adj.append((p.pos[0], p.pos[1] + 1))
+        #     if self.grid[p.pos[0], p.pos[1] - 1] == EMPTY:
+        #         adj.append((p.pos[0], p.pos[1] - 1))
+        #     if self.grid[p.pos[0] + 1, p.pos[1]] == EMPTY:
+        #         adj.append((p.pos[0] + 1, p.pos[1]))
+        #     if self.grid[p.pos[0] - 1, p.pos[1]] == EMPTY:
+        #         adj.append((p.pos[0] - 1, p.pos[1]))
+        #     if len(adj) == 0:  # Just in case there are no adjacent empty locations.
+        #         adj.append((p.pos[0], p.pos[1]))
+        #     return random.choice(adj)
 
         for p in self.people:
             if p.following:
                 continue
-            empty_adjacent: Tuple[int, int] = get_empty_adjacent_squares(p)
+            empty_adjacent: Tuple[int, int] = self._get_empty_adjacent_squares(p)
             self.grid[p.pos[0], p.pos[1]] = EMPTY
             p.pos = empty_adjacent
             self.grid[p.pos[0], p.pos[1]] = PERSON_TILE
@@ -1323,6 +1337,152 @@ class RescueGridworldEnv(gym.Env):
         dinfo.locked = False
         self.grid[pos] = DOOR_UNLOCKED
 
+    def get_path(self, start, end) -> List[Tuple[int, int]]:
+        r0, c0 = start[0] + 0.5, start[1] + 0.5
+        r1, c1 = end[0] + 0.5, end[1] + 0.5
+
+        assert start != end, "Start and end are the same"
+
+        r_grad = r1 - r0
+        c_grad = c1 - c0
+
+        num_steps = max(abs(r_grad), abs(c_grad))
+        direction = (
+            "r" if abs(r_grad) >= abs(c_grad) else "c"
+        )  # Is row or column the axis to step along?
+
+        path = []
+        if direction == "r":
+            grad = abs(c_grad / r_grad)
+            for s in range(int(num_steps) + 1):
+                path.append(
+                    (
+                        int(
+                            start[0] + ((r_grad + 1e-6) / (abs(r_grad) + 1e-6)) * s
+                        ),
+                        int(
+                            math.floor(
+                                c0
+                                + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6))
+                                * (s * grad)
+                            )
+                        ),
+                    )
+                )
+        else:
+            grad = abs(r_grad / c_grad)
+            for s in range(int(num_steps) + 1):
+                path.append(
+                    (
+                        int(
+                            (
+                                math.floor(
+                                    r0
+                                    + ((r_grad + 1e-6) / (abs(r_grad) + 1e-6))
+                                    * (s * grad)
+                                )
+                            )
+                        ),
+                        int(
+                            start[1] + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6)) * s
+                        ),
+                    )
+                )
+
+        return path
+
+    def _precompute_los_paths(self, window_size: int) -> Dict[Tuple[int, int], List[Tuple[int, int]]]:
+        paths = {}
+        r = window_size // 2
+        start = (r, r)
+
+        for row in range(window_size):
+            for col in range(window_size):
+                if (row, col) == start:
+                    paths[(row, col)] = []
+                    continue
+
+                path = self.get_path(start, (row, col))
+
+                paths[(row, col)] = path
+        return paths
+
+    def get_path(self, start, end) -> List[Tuple[int, int]]:
+        r0, c0 = start[0] + 0.5, start[1] + 0.5
+        r1, c1 = end[0] + 0.5, end[1] + 0.5
+
+        assert start != end, "Start and end are the same"
+
+        r_grad = r1 - r0
+        c_grad = c1 - c0
+
+        num_steps = max(abs(r_grad), abs(c_grad))
+        direction = (
+            "r" if abs(r_grad) >= abs(c_grad) else "c"
+        )  # Is row or column the axis to step along?
+
+        path = []
+        if direction == "r":
+            grad = abs(c_grad / r_grad)
+            for s in range(int(num_steps) + 1):
+                path.append(
+                    (
+                        int(
+                            start[0] + ((r_grad + 1e-6) / (abs(r_grad) + 1e-6)) * s
+                        ),
+                        int(
+                            math.floor(
+                                c0
+                                + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6))
+                                * (s * grad)
+                            )
+                        ),
+                    )
+                )
+        else:
+            grad = abs(r_grad / c_grad)
+            for s in range(int(num_steps) + 1):
+                path.append(
+                    (
+                        int(
+                            (
+                                math.floor(
+                                    r0
+                                    + ((r_grad + 1e-6) / (abs(r_grad) + 1e-6))
+                                    * (s * grad)
+                                )
+                            )
+                        ),
+                        int(
+                            start[1] + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6)) * s
+                        ),
+                    )
+                )
+
+        return path
+
+    def _has_los(self, target: Tuple[int, int], subgrid: np.ndarray) -> bool:
+        path = self._los_paths[target]
+        if not path:  # It's the center point
+            return True
+
+        # path[0] is the start point based on your original get_path logic
+        prev_r, prev_c = path[0][0], path[0][1]
+
+        for r, c in path[1:]:
+            # Use the O(1) set lookup
+            if subgrid[r, c] not in self._passable_tiles_set and (r, c) != path[-1]:
+                return False
+
+            if prev_r != r and prev_c != c:
+                if (subgrid[r, prev_c] not in self._passable_tiles_set and
+                        subgrid[prev_r, c] not in self._passable_tiles_set):
+                    return False
+
+            prev_r, prev_c = r, c
+
+        return True
+
     def _create_7x7_observation(self, ay: int, ax: int) -> Tuple[np.ndarray, np.ndarray]:
         window_size = self.obs_window_size
         r = window_size // 2
@@ -1353,100 +1513,17 @@ class RescueGridworldEnv(gym.Env):
             self.chain_id_grid[y0:y1, x0:x1]
         )
 
-        def get_path(start, end) -> List[Tuple[int, int]]:
-            r0, c0 = start[0] + 0.5, start[1] + 0.5
-            r1, c1 = end[0] + 0.5, end[1] + 0.5
-
-            assert start != end, "Start and end are the same"
-
-            r_grad = r1 - r0
-            c_grad = c1 - c0
-
-            num_steps = max(abs(r_grad), abs(c_grad))
-            direction = (
-                "r" if abs(r_grad) >= abs(c_grad) else "c"
-            )  # Is row or column the axis to step along?
-
-            path = []
-            if direction == "r":
-                grad = abs(c_grad / r_grad)
-                for s in range(int(num_steps) + 1):
-                    path.append(
-                        (
-                            int(
-                                start[0] + ((r_grad + 1e-6) / (abs(r_grad) + 1e-6)) * s
-                            ),
-                            int(
-                                math.floor(
-                                    c0
-                                    + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6))
-                                    * (s * grad)
-                                )
-                            ),
-                        )
-                    )
-            else:
-                grad = abs(r_grad / c_grad)
-                for s in range(int(num_steps) + 1):
-                    path.append(
-                        (
-                            int(
-                                (
-                                    math.floor(
-                                        r0
-                                        + ((r_grad + 1e-6) / (abs(r_grad) + 1e-6))
-                                        * (s * grad)
-                                    )
-                                )
-                            ),
-                            int(
-                                start[1] + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6)) * s
-                            ),
-                        )
-                    )
-
-            return path
-
-        def has_los(start, end, _subgrid) -> bool:
-
-            if start == end:
-                return True
-
-            path = get_path(start, end)
-
-            prev_r, prev_c = start[0], start[1]
-            for r, c in path[
-                1:
-            ]:  # We have start, and don't care if the target is passable
-                # check passable.
-                if _subgrid[r, c] not in self.passable_tiles and (r, c) != path[-1]:
-                    return False
-
-                # Check if this is a corner
-                if prev_r != r and prev_c != c:
-                    # If there is a pinch then we have no path
-                    if (
-                        _subgrid[r, prev_c] not in self.passable_tiles
-                        and _subgrid[prev_r, c] not in self.passable_tiles
-                    ):
-                        return False
-
-                prev_r, prev_c = r, c
-
-            # We got through the full path!
-            return True
-
         # Fill window with visible tiles
         for row in range(window_size):
             for col in range(window_size):
-                if has_los((r, r), (row, col), subgrid):
+                if self._has_los((row, col), subgrid):
                     window[row, col] = subgrid[row, col]
                     window_chains[row, col] = subgrid_chains[row, col]
 
         # Double-scan to account for initial scan-order issues
         for row in range(window_size - 1, -1, -1):
             for col in range(window_size - 1, -1, -1):
-                if not has_los((r, r), (row, col), window):
+                if not self._has_los((row, col), window):
                     window[row, col] = 100
                     window_chains[row, col] = -1
 
@@ -1457,7 +1534,9 @@ class RescueGridworldEnv(gym.Env):
         ppl_follow = np.zeros((self.num_people,), dtype=np.int8)
         ppl_resc = np.zeros((self.num_people,), dtype=np.int8)
         for i, p in enumerate(self.people):
-            ppl_pos[i] = np.array([p.pos[0], p.pos[1]], dtype=np.int64)
+            ppl_pos[i, 0] = p.pos[0]
+            ppl_pos[i, 1] = p.pos[1]
+            # ppl_pos[i] = np.array([p.pos[0], p.pos[1]], dtype=np.int64)
             ppl_follow[i] = 1 if p.following else 0
             ppl_resc[i] = 1 if p.rescued else 0
         ay, ax = self.agent_pos
