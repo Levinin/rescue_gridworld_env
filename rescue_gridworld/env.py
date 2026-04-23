@@ -581,8 +581,8 @@ class RescueGridworldEnv(gym.Env):
         return None
 
     def _ensure_capacity(self):
-        min_w, min_h = 12, 12
         spacing = 4
+        min_w, min_h = 8 + spacing * 2, 8 + spacing * 2
         cw = min_w + spacing
         ch = min_h + spacing
 
@@ -639,7 +639,7 @@ class RescueGridworldEnv(gym.Env):
                     return
             except Exception as e:
                 last_error = e
-                print(e, traceback.format_exc())
+                # print(e, traceback.format_exc())
         raise RuntimeError(
             f"Level generation failed after {MAX_ATTEMPTS} attempts. Last error: {last_error}. {traceback.format_exc()}. Try increasing grid size or lowering num_rooms."
         )
@@ -684,9 +684,10 @@ class RescueGridworldEnv(gym.Env):
         # --- Room placement ---
         min_w, min_h = 8, 8
         attempts = 0
+        max_attempts = self.num_rooms * 3
         min_spacing = 4
         overlaps: bool = False
-        while len(self.rooms) < self.num_rooms and attempts < 800:
+        while len(self.rooms) < self.num_rooms and attempts < max_attempts:
             overlaps = False
             attempts += 1
             rw = int(self._rng.integers(min_w, max(min(W - 4, 12), min_w + 1)))
