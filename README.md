@@ -43,7 +43,7 @@ There are 9 actions in the environment:
 
 ## Observation Space
 
-The observation provides 2 7x7 "windows". 
+The observation provides 2 7x7 "windows" (although this default can be changed by setting obs_window_size to any odd number when creating the environment).
 - The first is a line-of-sight observation of the local environment.
 - The second is a line-of-sight filtered set of "chain id's". 
 
