@@ -11,6 +11,7 @@ import numpy as np
 import pygame
 from gymnasium import spaces
 
+from rescue_gridworld.create_rooms import create_room_data_grid, ensure_capacity
 from rescue_gridworld.env_constants import *
 
 
@@ -63,13 +64,13 @@ class RescueGridworldEnv(gym.Env):
         debug_draw_chains: bool = False,
         reset_options: Dict[str, Any] = {},
         stochastic_transition_chance: float = 0.0,
-        obs_window_size: int = 7,       # Must be odd
+        obs_window_size: int = 7,  # Must be odd
     ):
         super().__init__()
         assert render_mode in (None, "human", "rgb_array")
         self.render_mode = render_mode
-        self.width = width
-        self.height = height
+        # self.width = width
+        # self.height = height
         self.num_rooms = max(1, num_rooms)
         self.num_keycards = num_keycards
         self.num_people = num_people
@@ -91,8 +92,18 @@ class RescueGridworldEnv(gym.Env):
         self.obs_window_size = obs_window_size
         self.observation_space = spaces.Dict(
             {
-                "grid": spaces.Box(low=0, high=255, shape=(1, obs_window_size, obs_window_size), dtype=np.uint8),
-                "chain_grid": spaces.Box(low=-2, high=np.inf, shape=(1, obs_window_size, obs_window_size), dtype=np.int64),
+                "grid": spaces.Box(
+                    low=0,
+                    high=255,
+                    shape=(1, obs_window_size, obs_window_size),
+                    dtype=np.uint8,
+                ),
+                "chain_grid": spaces.Box(
+                    low=-2,
+                    high=np.inf,
+                    shape=(1, obs_window_size, obs_window_size),
+                    dtype=np.int64,
+                ),
             }
         )
 
@@ -129,6 +140,17 @@ class RescueGridworldEnv(gym.Env):
         self._surface = None
 
         self._episode_rewards = 0
+
+        num_cols, num_rows, safety_margin = ensure_capacity(
+            height, 9, num_rooms, 6, width
+        )
+        self.height = num_rows
+        self.width = num_cols
+
+        da, db, dc = create_room_data_grid(num_rows, num_cols, 9, 50, 6)
+
+        # Fog of war
+        self.discovered_grid = np.zeros((self.height, self.width), dtype=bool)
 
         # Plan render
         self.debug_draw_chains = debug_draw_chains
@@ -344,7 +366,17 @@ class RescueGridworldEnv(gym.Env):
             if c.has_keycard:
                 y, x = pos
                 cx, cy = x * tile + tile // 2, y * tile + tile // 2
-                pygame.draw.rect(surf, (0, 0, 0), (x * tile + tile // 4, y * tile + tile // 4, tile - tile // 2, tile - tile // 2), width=1) #(cx - 3, cy - 8, 6, 16), width=1)
+                pygame.draw.rect(
+                    surf,
+                    (0, 0, 0),
+                    (
+                        x * tile + tile // 4,
+                        y * tile + tile // 4,
+                        tile - tile // 2,
+                        tile - tile // 2,
+                    ),
+                    width=1,
+                )
 
         for p in self.people:
             if p.following:
@@ -426,13 +458,20 @@ class RescueGridworldEnv(gym.Env):
                 (er.x + tile - 12, er.y + 2),
             )
 
+        # ---- Fog of War ----
+        fog_surf = pygame.Surface((tile, tile), pygame.SRCALPHA)
+        fog_surf.fill((100, 100, 100, 180))  # grey, semi-transparent
+        for y in range(self.height):
+            for x in range(self.width):
+                if not self.discovered_grid[y, x]:
+                    surf.blit(fog_surf, (x * tile, y * tile))
+
         ay, ax = self.agent_pos
         rect = pygame.Rect(ax * tile, ay * tile, tile, tile)
         pygame.draw.circle(surf, (250, 250, 250), rect.center, tile // 3)
         pygame.draw.circle(surf, (0, 0, 0), rect.center, tile // 3, width=2)
 
         if self.render_mode == "human":
-            # Handle events so the window stays responsive
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit()
@@ -440,11 +479,10 @@ class RescueGridworldEnv(gym.Env):
                     self._screen = None
                     self._clock = None
                     return
-            # blit and flip
             assert self._screen is not None
             self._screen.blit(surf, (0, 0))
             pygame.display.set_caption(
-                f"RescueGridworld | Step:{self._step_count} | Episode Reward:{round(self._episode_rewards,1)}"
+                f"RescueGridworld | Step:{self._step_count} | Episode Reward:{round(self._episode_rewards, 1)}"
             )
             pygame.display.flip()
             self._clock.tick(self.metadata["render_fps"])
@@ -475,13 +513,8 @@ class RescueGridworldEnv(gym.Env):
 
     def _get_empty_adjacent_squares(self, p: Person) -> Tuple[int, int]:
         r, c = p.pos
-
-        # Define the 4 possible adjacent coordinates
         candidates = ((r, c + 1), (r, c - 1), (r + 1, c), (r - 1, c))
-
-        # Filter valid positions using a comprehension
         valid_moves = [pos for pos in candidates if self.grid[pos] == EMPTY]
-
         return random.choice(valid_moves) if valid_moves else p.pos
 
     # PRIVATE METHODS
@@ -491,20 +524,6 @@ class RescueGridworldEnv(gym.Env):
         )
         if self._person_move_step_count != 0:  # Only move once per cycle.
             return
-
-        # def get_empty_adjacent_squares(p: Person) -> Tuple[int, int]:
-        #     adj = []
-        #     if self.grid[p.pos[0], p.pos[1] + 1] == EMPTY:
-        #         adj.append((p.pos[0], p.pos[1] + 1))
-        #     if self.grid[p.pos[0], p.pos[1] - 1] == EMPTY:
-        #         adj.append((p.pos[0], p.pos[1] - 1))
-        #     if self.grid[p.pos[0] + 1, p.pos[1]] == EMPTY:
-        #         adj.append((p.pos[0] + 1, p.pos[1]))
-        #     if self.grid[p.pos[0] - 1, p.pos[1]] == EMPTY:
-        #         adj.append((p.pos[0] - 1, p.pos[1]))
-        #     if len(adj) == 0:  # Just in case there are no adjacent empty locations.
-        #         adj.append((p.pos[0], p.pos[1]))
-        #     return random.choice(adj)
 
         for p in self.people:
             if p.following:
@@ -531,6 +550,7 @@ class RescueGridworldEnv(gym.Env):
             "_step_count",
             "solvable_plan",
             "chain_plan",
+            "discovered_grid",
         ]
 
         # Build the dict dynamically
@@ -581,54 +601,38 @@ class RescueGridworldEnv(gym.Env):
         return None
 
     def _ensure_capacity(self):
-        spacing = 4
-        min_w, min_h = 8 + spacing * 2, 8 + spacing * 2
-        cw = min_w + spacing
-        ch = min_h + spacing
+        """Ensure the grid is large enough for create_room_data_grid.
 
-        # Prevent division by zero
-        if self.width - 2 <= 0: self.width = 4
-        if self.height - 2 <= 0: self.height = 4
+        Uses the same parameters as create_room_data_grid to compute the
+        minimum physical grid dimensions that can hold num_rooms rooms.
+        """
+        min_room_size = 5
+        room_padding = 6
+        min_padded = min_room_size + room_padding
+        safety_margin = math.ceil(min_padded / 2.0)
 
-        eff_w = max(self.width - 2, 0)
-        eff_h = max(self.height - 2, 0)
-        
-        tiles_x = eff_w // cw
-        tiles_y = eff_h // ch
-        current_capacity = max(tiles_x * tiles_y, 1)
+        # Minimum simulation grid area to scatter num_rooms rooms
+        min_area = min_padded**2 * self.num_rooms
 
-        # If the grid is already large enough and meets absolute minimums, return
-        if current_capacity >= self.num_rooms and self.width >= min_w + 2 and self.height >= min_h + 2:
-            return
+        # Use current aspect ratio as target
+        aspect = self.height / max(self.width, 1)
 
-        # 1. Calculate the ideal ratio of X tiles to Y tiles to maintain aspect ratio
-        aspect_ratio_tiles = (self.width * ch) / (self.height * cw)
+        # Compute minimum simulation grid dimensions
+        sim_cols = math.ceil(math.sqrt(min_area / max(aspect, 0.01)))
+        sim_rows = math.ceil(min_area / sim_cols)
 
-        # 2. Derive the exact minimum number of abstract tiles needed
-        required_tiles_y = math.ceil(math.sqrt(self.num_rooms / aspect_ratio_tiles))
-        required_tiles_x = math.ceil(self.num_rooms / required_tiles_y)
+        # Physical grid = simulation grid + 2 * safety margin
+        required_width = sim_cols  # + 2 * safety_margin
+        required_height = sim_rows  # + 2 * safety_margin
 
-        # 3. Translate abstract tiles back to minimum physical grid dimensions
-        min_required_width = (required_tiles_x * (cw + 2)) + 2
-        min_required_height = (required_tiles_y * (ch + 2)) + 2
-
-        # 4. Extract the uniform scale factor
-        scale_x = min_required_width / self.width
-        scale_y = min_required_height / self.height
-        uniform_scale = max(scale_x, scale_y, 1.0)
-
-        # 5. Apply scale
-        self.width = math.ceil(self.width * uniform_scale)
-        self.height = math.ceil(self.height * uniform_scale)
-        
-        # Absolute minimums
-        self.width = max(self.width, min_w + 2)
-        self.height = max(self.height, min_h + 2)
+        self.width = max(self.width, required_width)
+        self.height = max(self.height, required_height)
 
     # --------------- Level generation (with solvable chain) ---------------
     def _generate_level(self):
-        # Retry loop for robust generation
-        self._ensure_capacity()
+        # Resize grid if needed before attempting generation
+        # self._ensure_capacity()
+
         MAX_ATTEMPTS = 1000
         last_error = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -663,6 +667,7 @@ class RescueGridworldEnv(gym.Env):
         self._step_count = 0
         self.solvable_plan = []
         self.chain_plan = {}
+        self.discovered_grid = np.zeros((H, W), dtype=bool)
 
     def _try_generate_one(self):
         H, W = self.height, self.width
@@ -681,41 +686,31 @@ class RescueGridworldEnv(gym.Env):
         return True
 
     def _place_rooms(self, H: int, W: int) -> bool:
-        # --- Room placement ---
-        min_w, min_h = 8, 8
-        attempts = 0
-        max_attempts = self.num_rooms * 3
-        min_spacing = 4
-        overlaps: bool = False
-        while len(self.rooms) < self.num_rooms and attempts < max_attempts:
-            overlaps = False
-            attempts += 1
-            rw = int(self._rng.integers(min_w, max(min(W - 4, 12), min_w + 1)))
-            rh = int(self._rng.integers(min_h, max(min(H - 4, 10), min_h + 1)))
-            x1 = int(self._rng.integers(1, W - rw - 1))
-            y1 = int(self._rng.integers(1, H - rh - 1))
-            x2, y2 = x1 + rw - 1, y1 + rh - 1
+        """Place rooms using force-directed layout from create_rooms module."""
+        room_bounds, phys_h, phys_w = create_room_data_grid(
+            height=H,
+            width=W,
+            min_room_size=9,
+            num_rooms=self.num_rooms,
+            room_padding=6,
+            rng=self._rng,
+        )
 
-            for ry1, rx1, ry2, rx2 in self.rooms:
-                if not (
-                    x2 + min_spacing < rx1
-                    or rx2 + min_spacing < x1
-                    or y2 + min_spacing < ry1
-                    or ry2 + min_spacing < y1
-                ):
-                    overlaps = True
-                    break
-            if overlaps:
-                continue
+        # If create_room_data_grid expanded the grid, resize our arrays
+        if phys_h != H or phys_w != W:
+            self.height = phys_h
+            self.width = phys_w
+            self.grid = np.full((phys_h, phys_w), WALL, dtype=np.int8)
+            self.chain_id_grid = np.full((phys_h, phys_w), -1, dtype=np.int16)
+            self.discovered_grid = np.zeros((phys_h, phys_w), dtype=bool)
 
-            self.grid[y1 : y2 + 1, x1 : x2 + 1] = EMPTY
-            self.rooms.append((y1, x1, y2, x2))
+        # Convert room_bounds [r_min, r_max, c_min, c_max] to
+        # self.rooms format (y1, x1, y2, x2)
+        for r_min, r_max, c_min, c_max in room_bounds:
+            self.grid[r_min : r_max + 1, c_min : c_max + 1] = EMPTY
+            self.rooms.append((r_min, c_min, r_max, c_max))
 
-        if overlaps:
-            return False
-
-        assert len(self.rooms) >= 1, "No rooms placed."
-        return True
+        return len(self.rooms) >= 1
 
     def _connect_rooms(self):
         centers = [((r[0] + r[2]) // 2, (r[1] + r[3]) // 2) for r in self.rooms]
@@ -1092,12 +1087,6 @@ class RescueGridworldEnv(gym.Env):
                 continue
 
             return pos, room_idx
-            # for min_d in (3, 2):
-            #     for pos in candidates:
-            #         if self._dist_to_nearest_door(pos) >= min_d:
-            #             return pos, room_idx
-
-        # print(f"Failed to place cupboard in {room_idx_path} after 100 attempts.")
         raise IndexError("Failed to place cupboard after 100 attempts.")
 
     def _place_key_in_room(self, _key_room_path: List) -> Tuple[Tuple[int, int], int]:
@@ -1112,8 +1101,6 @@ class RescueGridworldEnv(gym.Env):
             if pos is None or not self._adjacent_squares_empty(pos):
                 continue
             return pos, room_idx
-        # Fallback after all attempts
-        # print(f"Unable to place key in {_key_room_path}")
         raise IndexError("Failed to place key after 100 attempts.")
 
     def _place_people(self):
@@ -1192,7 +1179,7 @@ class RescueGridworldEnv(gym.Env):
         code = self.grid[y, x]
         if code in (EMPTY, KEY_TILE, EXIT, DOOR_LOCKED, DOOR_UNLOCKED):
             return True
-        return False  # cupboards/walls are blocked for path
+        return False
 
     def _bfs_path_cells(
         self, start: Tuple[int, int], goal: Tuple[int, int]
@@ -1358,14 +1345,11 @@ class RescueGridworldEnv(gym.Env):
             for s in range(int(num_steps) + 1):
                 path.append(
                     (
-                        int(
-                            start[0] + ((r_grad + 1e-6) / (abs(r_grad) + 1e-6)) * s
-                        ),
+                        int(start[0] + ((r_grad + 1e-6) / (abs(r_grad) + 1e-6)) * s),
                         int(
                             math.floor(
                                 c0
-                                + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6))
-                                * (s * grad)
+                                + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6)) * (s * grad)
                             )
                         ),
                     )
@@ -1384,15 +1368,15 @@ class RescueGridworldEnv(gym.Env):
                                 )
                             )
                         ),
-                        int(
-                            start[1] + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6)) * s
-                        ),
+                        int(start[1] + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6)) * s),
                     )
                 )
 
         return path
 
-    def _precompute_los_paths(self, window_size: int) -> Dict[Tuple[int, int], List[Tuple[int, int]]]:
+    def _precompute_los_paths(
+        self, window_size: int
+    ) -> Dict[Tuple[int, int], List[Tuple[int, int]]]:
         paths = {}
         r = window_size // 2
         start = (r, r)
@@ -1428,14 +1412,11 @@ class RescueGridworldEnv(gym.Env):
             for s in range(int(num_steps) + 1):
                 path.append(
                     (
-                        int(
-                            start[0] + ((r_grad + 1e-6) / (abs(r_grad) + 1e-6)) * s
-                        ),
+                        int(start[0] + ((r_grad + 1e-6) / (abs(r_grad) + 1e-6)) * s),
                         int(
                             math.floor(
                                 c0
-                                + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6))
-                                * (s * grad)
+                                + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6)) * (s * grad)
                             )
                         ),
                     )
@@ -1454,9 +1435,7 @@ class RescueGridworldEnv(gym.Env):
                                 )
                             )
                         ),
-                        int(
-                            start[1] + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6)) * s
-                        ),
+                        int(start[1] + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6)) * s),
                     )
                 )
 
@@ -1476,15 +1455,19 @@ class RescueGridworldEnv(gym.Env):
                 return False
 
             if prev_r != r and prev_c != c:
-                if (subgrid[r, prev_c] not in self._passable_tiles_set and
-                        subgrid[prev_r, c] not in self._passable_tiles_set):
+                if (
+                    subgrid[r, prev_c] not in self._passable_tiles_set
+                    and subgrid[prev_r, c] not in self._passable_tiles_set
+                ):
                     return False
 
             prev_r, prev_c = r, c
 
         return True
 
-    def _create_7x7_observation(self, ay: int, ax: int) -> Tuple[np.ndarray, np.ndarray]:
+    def _create_7x7_observation(
+        self, ay: int, ax: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
         window_size = self.obs_window_size
         r = window_size // 2
         H, W = self.grid.shape
@@ -1510,9 +1493,9 @@ class RescueGridworldEnv(gym.Env):
         subgrid[w_start_y : w_start_y + w_size_y, w_start_x : w_start_x + w_size_x] = (
             self.grid[y0:y1, x0:x1]
         )
-        subgrid_chains[w_start_y : w_start_y + w_size_y, w_start_x : w_start_x + w_size_x] = (
-            self.chain_id_grid[y0:y1, x0:x1]
-        )
+        subgrid_chains[
+            w_start_y : w_start_y + w_size_y, w_start_x : w_start_x + w_size_x
+        ] = self.chain_id_grid[y0:y1, x0:x1]
 
         # Fill window with visible tiles
         for row in range(window_size):
@@ -1520,6 +1503,12 @@ class RescueGridworldEnv(gym.Env):
                 if self._has_los((row, col), subgrid):
                     window[row, col] = subgrid[row, col]
                     window_chains[row, col] = subgrid_chains[row, col]
+
+                    # Update global discovered_grid
+                    gy = y0 + (row - w_start_y)
+                    gx = x0 + (col - w_start_x)
+                    if 0 <= gy < H and 0 <= gx < W:
+                        self.discovered_grid[gy, gx] = True
 
         # Double-scan to account for initial scan-order issues
         for row in range(window_size - 1, -1, -1):
