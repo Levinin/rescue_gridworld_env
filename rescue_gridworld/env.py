@@ -2,6 +2,7 @@ import math
 import os
 import random
 import traceback
+from copy import deepcopy
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -65,13 +66,13 @@ class RescueGridworldEnv(gym.Env):
         reset_options: Dict[str, Any] = {},
         stochastic_transition_chance: float = 0.0,
         obs_window_size: int = 7,  # Must be odd
+        has_fire: bool = False,
+        fire_speed: int = 60,
     ):
         super().__init__()
         assert render_mode in (None, "human", "rgb_array")
         self.render_mode = render_mode
-        # self.width = width
-        # self.height = height
-        self.num_rooms = max(1, num_rooms)
+        self.num_rooms = max(3 if has_fire else 2, num_rooms)
         self.num_keycards = num_keycards
         self.num_people = num_people
         self.num_keys = num_keys
@@ -86,8 +87,10 @@ class RescueGridworldEnv(gym.Env):
         self.reset_options = reset_options
 
         self.stochastic_transition_chance = stochastic_transition_chance
+        self.has_fire = has_fire
+        self.fire_speed = fire_speed
 
-        self.action_space = spaces.Discrete(9)
+        self.action_space = spaces.Discrete(10)
         assert obs_window_size % 2 == 1, "The window size must be an odd number."
         self.obs_window_size = obs_window_size
         self.observation_space = spaces.Dict(
@@ -108,18 +111,24 @@ class RescueGridworldEnv(gym.Env):
         )
 
         # dynamic state
-        self.grid = None  # np.ndarray
-        self.chain_id_grid = None  # np.ndarray
+        self.grid: np.ndarray
+        self.chain_id_grid: np.ndarray
+        self.door_temp_checked: Dict[Tuple[int, int], bool] = {}  # Doors temp checked and if hot.
         self.rooms: List[
             Tuple[int, int, int, int]
         ] = []  # list of room rects (y1, x1, y2, x2)
         self.doors: Dict[Tuple[int, int], DoorInfo] = {}  # pos -> DoorInfo
-        self.room_graph: Dict[int, List[int]] = {}  # adjacency on room indices
+        self.room_graph: Dict[int, List[int]] = {}        # adjacency on room indices
         self.cupboards: Dict[Tuple[int, int], Cupboard] = {}
         self.people: List[Person] = []
-        self.people_following: int = 0  # How many people are following the agent
+        self.people_following: int = 0  # How many people have been saved
+        self.people_died: int = 0  # How many people have died in the fire
+        self.previous_traversable_code: List[int] = []
         self.agent_pos: Tuple[int, int] = (0, 0)
         self.exit_pos: Tuple[int, int] = (0, 0)
+        self.start_pos: Tuple[int, int] = (0, 0)
+        self.fire_pos: Tuple[int, int] = (0, 0)
+        self.fire_counter: int = 0
         self.inventory = {
             "keys": 0,  # generic keys (for unbound cupboards only)
             "keycards": 0,  # generic keycards (for unbound doors only)
@@ -132,7 +141,7 @@ class RescueGridworldEnv(gym.Env):
         self._step_count = 0
         self.solvable_plan: List[dict] = []
         self._person_move_step_count = 0
-        self._person_move_step = lambda x: (x + 1) % 3  # Loop 3 steps
+        self._person_move_step = lambda x: (x + 1) % 4  # Loop 3 steps
 
         # rendering
         self._screen = None
@@ -147,7 +156,7 @@ class RescueGridworldEnv(gym.Env):
         self.height = num_rows
         self.width = num_cols
 
-        da, db, dc = create_room_data_grid(num_rows, num_cols, 9, 50, 6)
+        _, _, _ = create_room_data_grid(num_rows, num_cols, 9, 50, 6)
 
         # Fog of war
         self.discovered_grid = np.zeros((self.height, self.width), dtype=bool)
@@ -158,10 +167,27 @@ class RescueGridworldEnv(gym.Env):
             int, Dict[str, Tuple[int, int]]
         ] = {}  # chain_id -> {"key":(y,x), "cupboard":(y,x), "door":(y,x)}
         self._font_small = None  # lazy-init in render
-        self.passable_tiles = [EMPTY, KEY_TILE, PERSON_TILE, DOOR_UNLOCKED, EXIT]
+        self.passable_tiles = [EMPTY, KEY_TILE, PERSON_TILE, EXIT, FIRE, DOOR_OPEN]
 
-        self._passable_tiles_set = {EMPTY, KEY_TILE, PERSON_TILE, DOOR_UNLOCKED, EXIT}
+        self._passable_tiles_set = {EMPTY, KEY_TILE, PERSON_TILE, EXIT, FIRE, DOOR_OPEN}
         self._los_paths = self._precompute_los_paths(self.obs_window_size)
+
+        self._current_direction = NORTH
+
+        self.door_types = [DOOR_LOCKED, DOOR_UNLOCKED, DOOR_LOCKED_HOT, DOOR_UNLOCKED_HOT, DOOR_LOCKED_COLD, DOOR_UNLOCKED_COLD]
+        self.door_locked_types = [DOOR_LOCKED, DOOR_LOCKED_HOT, DOOR_LOCKED_COLD]
+        self.door_unlocked_types = [DOOR_UNLOCKED, DOOR_UNLOCKED_HOT, DOOR_UNLOCKED_COLD]
+
+        # To render orientation
+        s = tile_size // 3
+        self.dir_offsets = {
+            0: [(0, -s), (-s, s), (s, s)],    # North
+            1: [(s, 0), (-s, -s), (-s, s)],   # East
+            2: [(0, s), (s, -s), (-s, -s)],   # South
+            3: [(-s, 0), (s, -s), (s, s)]     # West
+        }
+
+        self.opened_door_original_type: Dict[Tuple[int, int], int] = {}
 
     # --------------- Gym API ---------------
     def reset(self, *, seed: Optional[int] = None, options: Dict[str, Any] | None = {}):
@@ -173,124 +199,53 @@ class RescueGridworldEnv(gym.Env):
             self.obtain_all_chain_keys_keycards()
 
         obs = self._get_obs()
+        self.opened_door_original_type.clear()
         self._step_count = 0
         self.people_following = 0
+        self.people_died = 0
         self._episode_rewards = 0
+        self._fire_counter = 0
+        self._current_direction = NORTH
         info = self._update_info()
         return obs, info
 
     def step(self, action: int):
         assert self.action_space.contains(action), f"ERROR: {action} is invalid."
-        reward = -0.05
+        reward: float = -0.05
+
+        self._fire_counter = (self._fire_counter + 1) % self.fire_speed
+        if self._fire_counter == 0:
+            self._expand_fire()
+
         terminated = False
         truncated = False
-        info = {}
+        info: Dict[str, Any] = {}
         info["action_success"] = False
         info["action_code"] = int(action)
+        info["Truncate_Reason"] = "N/A"
 
         # Sometimes a random action will occur.
         if random.random() < self.stochastic_transition_chance:
             action = random.randint(0, 8)
 
-        y, x = self.agent_pos
-        dy, dx = 0, 0
-        if action in (UP, DOWN, LEFT, RIGHT):
-            if action == UP:
-                dy = -1
-            elif action == DOWN:
-                dy = 1
-            elif action == LEFT:
-                dx = -1
-            else:
-                dx = 1
-            ny, nx = y + dy, x + dx
-            if self.grid[ny, nx] in self.passable_tiles:
-                # if self._is_within(ny, nx) and self._can_enter(ny, nx):
-                self.agent_pos = (ny, nx)
-                info["action_success"] = True
+        # Did the fire catch us?
+        if self.grid[self.agent_pos] == FIRE:
+            reward -= 10.0
+            info["Truncate_Reason"] = "Caught by fire"
+            truncated = True
 
-            if self.grid[self.agent_pos] == EXIT:
-                terminated = True
-                reward += 5.0
-                if all(p.following for p in self.people):
-                    reward += 50.0
-                    info["success"] = True
+        if not (terminated or truncated):
+            # If we took a temperature reading on the previous action then revert the door to its original state
+            # since the environment should not remember sensor readings.
+            self._remove_temp_sensor_reading()
+            r, terminated, truncated = self._perform_action(action, info)
+            reward += r
 
-        elif action == PICK_KEY:
-            if self.grid[y, x] == KEY_TILE:
-                self.grid[y, x] = EMPTY
-                self.chain_id_grid[y, x] = -1
-                # Chain-bound or generic?
-                info["action_success"] = True
-                entry = self._chain_at_pos.pop((y, x), None)
-                if entry is not None:
-                    kind, cid = entry
-                    if kind == "key":
-                        self.inventory["key_ids"].add(cid)
-                else:
-                    self.inventory["keys"] += 1
-                reward += 5
-
-        elif action == UNLOCK_CUPBOARD:
-            cpos = self._adjacent_of_type_with_chain_id({CUPBOARD_LOCKED})
-            # cpos = self._adjacent_of_type({CUPBOARD_LOCKED})
-            if cpos is not None:
-                cup = self.cupboards.get(cpos)
-                if cup and cup.locked:
-                    if cup.chain_id is not None:
-                        # Strict: require matching chain key id
-                        if cup.chain_id in self.inventory["key_ids"]:
-                            self.inventory["key_ids"].remove(cup.chain_id)
-                            self._unlock_cupboard(cpos)
-                            reward += 5
-                            info["action_success"] = True
-                    else:
-                        # Unbound cupboard: use generic key if available
-                        if self.inventory["keys"] > 0:
-                            self.inventory["keys"] -= 1
-                            self._unlock_cupboard(cpos)
-                            reward += 5
-                            info["action_success"] = True
-
-        elif action == PICK_KEYCARD:
-            cpos = self._adjacent_cupboard_with_keycard_unlocked()
-            if cpos is not None:
-                cup = self.cupboards[cpos]
-                cup.has_keycard = False
-                if cup.chain_id is not None:
-                    self.inventory["keycard_ids"].add(cup.chain_id)
-                else:
-                    self.inventory["keycards"] += 1
-                self.grid[cpos] = CUPBOARD_UNLOCKED
-                reward += 5
-                info["action_success"] = True
-
-        elif action == UNLOCK_DOOR:
-            dpos = self._adjacent_of_type_with_chain_id({DOOR_LOCKED})
-            if dpos is not None:
-                dinfo = self.doors.get(dpos)
-                if dinfo and dinfo.locked:
-                    if dinfo.chain_id is not None:
-                        if dinfo.chain_id in self.inventory["keycard_ids"]:
-                            self.inventory["keycard_ids"].remove(dinfo.chain_id)
-                            self._unlock_door(dpos)
-                            reward += 5
-                            info["action_success"] = True
-                    else:
-                        if self.inventory["keycards"] > 0:
-                            self.inventory["keycards"] -= 1
-                            self._unlock_door(dpos)
-                            reward += 5
-                            info["action_success"] = True
-
-        elif action == TALK_PERSON:
-            for p in self.people:
-                if not p.following and p.pos == self.agent_pos:
-                    p.following = True
-                    self.grid[p.pos] = EMPTY
-                    self.people_following += 1
-                    reward += 5
-                    info["action_success"] = True
+        # Did we step into fire?
+        if self.grid[self.agent_pos] == FIRE:
+            reward -= 10.0
+            info["Truncate_Reason"] = "Stepped into fire"
+            truncated = True
 
         self._move_people()
 
@@ -298,11 +253,216 @@ class RescueGridworldEnv(gym.Env):
 
         self._step_count += 1
         if self._step_count >= self.max_steps:
+            info["Truncate_Reason"] = "Episode length exceeded"
             truncated = True
+
 
         self._episode_rewards += reward
 
         return self._get_obs(), reward, terminated, truncated, info
+
+    def _remove_temp_sensor_reading(self) -> None:
+        """Remove the just taken temp sensor reading from the grid since the env
+        should not remember sensor readings, that is the agent's job."""
+        drow, dcol = forward_offset.get(self._current_direction, (0, 0))
+        row, col = self.agent_pos[0] + drow, self.agent_pos[1] + dcol
+        if self.grid[row, col] in [DOOR_LOCKED_COLD, DOOR_LOCKED_HOT]:
+            self.grid[row, col] = DOOR_LOCKED
+        elif self.grid[row, col] in [DOOR_UNLOCKED_HOT, DOOR_UNLOCKED_COLD]:
+            self.grid[row, col] = DOOR_UNLOCKED
+
+    def _perform_action(self, action: int, info: dict[str, Any]) -> Tuple[float, bool, bool]:
+        """Perform the action in the environment and return an update to the rewarad."""
+
+        terminated, truncated = False, False
+        reward = 0
+
+        if action in (FORWARD, ROT_LEFT, ROT_RIGHT):
+            r, terminated, truncated = self._action_navigate(info, action)
+            reward += r    # Do this to avoid accidents if we change rewards earlier in the method.
+
+        elif action == PICK_KEY:
+            r, terminated, truncated = self._action_pick_key(info)
+            reward += r
+
+        elif action == UNLOCK_CUPBOARD:
+            r, terminated, truncated = self._action_unlock_cupboard(info)
+            reward += r
+
+        elif action == PICK_KEYCARD:
+            r, terminated, truncated = self._action_pick_keycard(info)
+            reward += r
+
+        elif action == CHECK_DOOR_TEMP:
+            # Checks the temp of the door ahead of the agent
+            # No reward for checking the door temp
+            self._action_check_door_temp(info)
+
+        elif action == UNLOCK_DOOR:
+            r, terminated, truncated = self._action_unlock_door(info)
+            reward += r
+
+        elif action == OPEN_DOOR:
+            # No reward for opening the door.
+            self._action_open_door(info)
+
+        elif action == TALK_PERSON:
+            r, terminated, truncated = self._action_talk_people(info)
+            reward += r
+
+        return reward, terminated, truncated
+
+    def _action_navigate(self, info: Dict[str, Any], action: int) -> Tuple[float, bool, bool]:
+        reward = 0
+        row, col = self.agent_pos
+        drow, dcol = 0, 0
+        terminated, truncated = False, False
+
+        if action == FORWARD:
+            drow, dcol = forward_offset.get(self._current_direction, (0, 0))
+        elif action == ROT_LEFT:
+            self._current_direction = (self._current_direction - 1) % 4
+        else:
+            self._current_direction = (self._current_direction + 1) % 4
+
+        nrow, ncol = row + drow, col + dcol
+        if self.grid[nrow, ncol] in self.passable_tiles:
+            self.agent_pos = (nrow, ncol)
+            # If we turn away from the door, or move through it, close the door to the previous type
+            # Happens after movement so we don't close it on ourselves as we move through the door.
+            open_door_loc = self._adjacent_of_type({DOOR_OPEN})
+            if open_door_loc:
+                self.grid[open_door_loc] = self.opened_door_original_type.pop(open_door_loc)
+            info["action_success"] = True
+
+        if self.grid[self.agent_pos] == EXIT:
+            terminated = True
+            reward += 5.0           # Add base reward for exiting.
+            if not self.people:     # Everyone has been rescued.
+                reward += 50.0
+                info["success"] = True
+
+        return reward, terminated, truncated
+
+    def _action_pick_key(self, info: Dict[str, Any]) -> Tuple[float, bool, bool]:
+        if self.grid[self.agent_pos] == KEY_TILE:
+            self.grid[self.agent_pos] = EMPTY
+            self.chain_id_grid[self.agent_pos] = -1
+            info["action_success"] = True
+            entry = self._chain_at_pos.pop((self.agent_pos), None)
+            if entry is not None:
+                kind, cid = entry
+                if kind == "key":
+                    self.inventory["key_ids"].add(cid)
+                return 5., False, False
+        return 0, False, False
+
+    def _action_unlock_cupboard(self, info:Dict[str, Any]) -> Tuple[float, bool, bool]:
+        cpos = self._ahead_of_type_with_chain_id({CUPBOARD_LOCKED})
+        if cpos is not None:
+            cup = self.cupboards.get(cpos)
+            if cup and cup.locked:
+                if cup.chain_id in self.inventory["key_ids"]:
+                    self.inventory["key_ids"].remove(cup.chain_id)
+                    self._unlock_cupboard(cpos)
+                    info["action_success"] = True
+                    return 5, False, False
+        return 0, False, False
+
+    def _action_pick_keycard(self, info: Dict[str, Any]) -> Tuple[float, bool, bool]:
+        cpos = self._forward_cupboard_with_keycard_unlocked()
+        if cpos is not None:
+            cup = self.cupboards[cpos]
+            cup.has_keycard = False
+            if cup.chain_id is not None:
+                self.inventory["keycard_ids"].add(cup.chain_id)
+            else:
+                self.inventory["keycards"] += 1
+            self.grid[cpos] = CUPBOARD_UNLOCKED
+            info["action_success"] = True
+            return 5., False, False
+        return 0, False, False
+
+    def _action_check_door_temp(self, info: Dict[str, Any]) -> None:
+        offset = forward_offset[self._current_direction]
+        ar, ac = self.agent_pos
+        pos = (ar + offset[0], ac + offset[1])
+        dpos = pos if self.grid[pos] in self.door_types else None
+        if dpos is not None:
+            door_hot: bool = self._check_if_door_is_hot(dpos)
+            if door_hot and self.grid[dpos] in self.door_locked_types:
+                self.grid[dpos]  = DOOR_LOCKED_HOT
+            elif door_hot and self.grid[dpos] in self.door_unlocked_types:
+                self.grid[dpos] = DOOR_UNLOCKED_HOT
+            elif not door_hot and self.grid[dpos] in self.door_locked_types:
+                self.grid[dpos] = DOOR_LOCKED_COLD
+            elif not door_hot and self.grid[dpos] in self.door_unlocked_types:
+                self.grid[dpos] = DOOR_UNLOCKED_COLD
+            self.door_temp_checked[dpos] = door_hot
+            info["action_success"] = True    # No reward here
+
+    def _action_unlock_door(self, info: Dict[str, Any]) -> Tuple[float, bool, bool]:
+        dpos = self._ahead_of_type_with_chain_id({DOOR_LOCKED_COLD, DOOR_LOCKED_HOT, DOOR_LOCKED})
+        reward = 0
+        if dpos is not None:
+            dinfo = self.doors.get(dpos)
+            if dinfo and dinfo.locked:
+                if dinfo.chain_id in self.inventory["keycard_ids"]:
+                    self.inventory["keycard_ids"].remove(dinfo.chain_id)
+                    self._unlock_door(dpos)
+                    # Only give a reward for unlocking a door if we have checked the temp first.
+                    if self.door_temp_checked.get(dpos, 9) != 9:
+                        reward = 5
+                        if self.door_temp_checked.get(dpos):
+                            self.grid[dpos] = DOOR_UNLOCKED_HOT
+                        else:
+                            self.grid[dpos] = DOOR_UNLOCKED_COLD
+                    info["action_success"] = True
+        return reward, False, False
+
+    def _action_open_door(self, info: Dict[str, Any]) -> None:
+        # The door must be ahead of us and unlocked.
+        dir_o = forward_offset[self._current_direction]
+        r, c = self.agent_pos[0] + dir_o[0], self.agent_pos[1] + dir_o[1]
+        if self.grid[r, c] in self.door_unlocked_types:
+            self.opened_door_original_type[(r,c)] = self.grid[r, c]
+            self.grid[r, c] = DOOR_OPEN
+            info["action_success"] = True
+            # Penalty for opening the door if there is fire here:
+            if self._check_if_door_is_hot((r,c)):
+                [self._expand_fire() for _ in range(3)]
+
+    def _action_talk_people(self, info: Dict[str, Any]) -> Tuple[float, bool, bool]:
+        num_people = len(self.people)
+        for idx in range(num_people):
+            if self.people[idx].pos == self.agent_pos:
+                self.grid[self.people[idx].pos] = self.previous_traversable_code[idx]
+                self.previous_traversable_code.pop(idx)
+                self.people.pop(idx)
+                self.people_following += 1
+                reward = 5
+                info["action_success"] = True
+                return reward, False, False
+        return 0, False, False
+
+    def _check_if_door_is_hot(self, dpos: Tuple[int, int]) -> bool:
+        """Checks the door temp by detecting fire 7x8 squares forward centred on the door directly through the door."""
+        # First determine the direction of the door relative to the agent
+        direction = (dpos[0] - self.agent_pos[0], dpos[1] - self.agent_pos[1])
+        if direction[0] == 0:
+            row_start = self.agent_pos[0] - 3
+            row_end = self.agent_pos[0] + 3
+            col_start = self.agent_pos[1] + direction[1]
+            col_end = self.agent_pos[1] + direction[1] * 8
+        else:
+            row_start = self.agent_pos[0] + direction [0]
+            row_end = self.agent_pos[0] + direction[0] * 8
+            col_start = self.agent_pos[1] - 3
+            col_end = self.agent_pos[1] + 3
+        if FIRE in self.grid[min(row_start, row_end):max(row_start, row_end),
+            min(col_start, col_end):max(col_start, col_end)]:
+            return True
+        return False
 
     def render(self):
         if self.render_mode is None:
@@ -344,8 +504,18 @@ class RescueGridworldEnv(gym.Env):
                     color = (60, 60, 60)
                 elif code == DOOR_LOCKED:
                     color = (200, 60, 60)
+                elif code == DOOR_LOCKED_HOT:
+                    color = (200, 60, 60)
+                elif code == DOOR_LOCKED_COLD:
+                    color = (200, 60, 60)
                 elif code == DOOR_UNLOCKED:
                     color = (60, 200, 60)
+                elif code == DOOR_UNLOCKED_COLD:
+                    color = (60, 200, 60)
+                elif code == DOOR_UNLOCKED_HOT:
+                    color = (60, 200, 60)
+                elif code == DOOR_OPEN:
+                    color = (100, 255, 100)
                 elif code == CUPBOARD_LOCKED:
                     color = (139, 90, 43)
                 elif code == CUPBOARD_UNLOCKED:
@@ -356,6 +526,8 @@ class RescueGridworldEnv(gym.Env):
                     color = (240, 240, 240)  # floor; we'll draw key icon below
                 elif code == EXIT:
                     color = (168, 85, 247)
+                elif code == FIRE:
+                    color = (252, 186, 3)
                 pygame.draw.rect(surf, color, rect)
                 pygame.draw.rect(surf, (210, 210, 210), rect, width=1)
 
@@ -376,7 +548,7 @@ class RescueGridworldEnv(gym.Env):
                         tile - tile // 2,
                     ),
                     width=1,
-                )
+                )  # (cx - 3, cy - 8, 6, 16), width=1)
 
         for p in self.people:
             if p.following:
@@ -467,11 +639,26 @@ class RescueGridworldEnv(gym.Env):
                     surf.blit(fog_surf, (x * tile, y * tile))
 
         ay, ax = self.agent_pos
-        rect = pygame.Rect(ax * tile, ay * tile, tile, tile)
-        pygame.draw.circle(surf, (250, 250, 250), rect.center, tile // 3)
-        pygame.draw.circle(surf, (0, 0, 0), rect.center, tile // 3, width=2)
+        # Calculate absolute center (World Space)
+        cx = ax * tile + tile // 2
+        cy = ay * tile + tile // 2
+
+        # Fetch the relative points for our current direction
+        local_points = self.dir_offsets[self._current_direction]
+
+        # Apply the translation offset to create the final render points
+        points = [(cx + dx, cy + dy) for dx, dy in local_points]
+
+        # Render
+        pygame.draw.polygon(surf, (250, 250, 250), points)
+        pygame.draw.polygon(surf, (0, 0, 0), points, width=2)
+
+        # rect = pygame.Rect(ax * tile, ay * tile, tile, tile)
+        # pygame.draw.circle(surf, (250, 250, 250), rect.center, tile // 3)
+        # pygame.draw.circle(surf, (0, 0, 0), rect.center, tile // 3, width=2)
 
         if self.render_mode == "human":
+            # Handle events so the window stays responsive
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit()
@@ -479,6 +666,7 @@ class RescueGridworldEnv(gym.Env):
                     self._screen = None
                     self._clock = None
                     return
+            # blit and flip
             assert self._screen is not None
             self._screen.blit(surf, (0, 0))
             pygame.display.set_caption(
@@ -511,11 +699,28 @@ class RescueGridworldEnv(gym.Env):
                 self.inventory["key_ids"].add(cup_info.chain_id)
                 self.inventory["keycard_ids"].add(cup_info.chain_id)
 
-    def _get_empty_adjacent_squares(self, p: Person) -> Tuple[int, int]:
+    def _get_random_adjacent_traversable_square(self, p: Person) -> Tuple[int, int]:
         r, c = p.pos
+
+        # Define the 4 possible adjacent coordinates
         candidates = ((r, c + 1), (r, c - 1), (r + 1, c), (r - 1, c))
+
+        # Filter valid positions using a comprehension.
         valid_moves = [pos for pos in candidates if self.grid[pos] == EMPTY]
+
         return random.choice(valid_moves) if valid_moves else p.pos
+
+    def _expand_fire(self) -> None:
+        """Cycle through the grid and expand fire in adjacent non-wall squares."""
+        m = deepcopy(self.grid)
+        for r in range(self.height):
+            for c in range(self.width):
+                if self.grid[r, c] == FIRE:
+                    for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        nr, nc = r + dr, c + dc
+                        if (self.grid[nr, nc] != WALL):
+                            m[nr, nc] = FIRE
+        self.grid = m
 
     # PRIVATE METHODS
     def _move_people(self) -> None:
@@ -525,13 +730,18 @@ class RescueGridworldEnv(gym.Env):
         if self._person_move_step_count != 0:  # Only move once per cycle.
             return
 
-        for p in self.people:
-            if p.following:
+        people = len(self.people)
+        for i in range(people - 1, -1, -1):
+            if self.grid[self.people[i].pos] == FIRE:
+                self.people.pop(i)   # Fire caught them, so let's remove them.
+                self.previous_traversable_code.pop(i)
+                self.people_died += 1
                 continue
-            empty_adjacent: Tuple[int, int] = self._get_empty_adjacent_squares(p)
-            self.grid[p.pos[0], p.pos[1]] = EMPTY
-            p.pos = empty_adjacent
-            self.grid[p.pos[0], p.pos[1]] = PERSON_TILE
+            empty_adjacent: Tuple[int, int] = self._get_random_adjacent_traversable_square(self.people[i])
+            self.grid[self.people[i].pos] = self.previous_traversable_code[i]
+            self.previous_traversable_code[i] = self.grid[empty_adjacent]
+            self.people[i].pos = empty_adjacent
+            self.grid[self.people[i].pos] = PERSON_TILE
 
     def _update_info(self) -> Dict[str, Any]:
         """Add the dynamic data to the info dict."""
@@ -543,7 +753,9 @@ class RescueGridworldEnv(gym.Env):
             "cupboards",
             "people",
             "people_following",
+            "people_died",
             "agent_pos",
+            "door_temp_checked",
             "exit_pos",
             "inventory",
             "_chain_at_pos",
@@ -572,7 +784,7 @@ class RescueGridworldEnv(gym.Env):
                 pairs.append(((y, x2 + 1), (y, x2)))
         return pairs
 
-    def _find_or_create_door_into_room(self, room_idx) -> tuple or None:
+    def _find_or_create_door_into_room(self, room_idx) -> Tuple[int, int] | None:
         rect = self.rooms[room_idx]
         # Prefer existing corridor contact
         for outside, inside in self._room_boundary_cells(rect):
@@ -600,38 +812,8 @@ class RescueGridworldEnv(gym.Env):
                 return (oy, ox)
         return None
 
-    def _ensure_capacity(self):
-        """Ensure the grid is large enough for create_room_data_grid.
-
-        Uses the same parameters as create_room_data_grid to compute the
-        minimum physical grid dimensions that can hold num_rooms rooms.
-        """
-        min_room_size = 5
-        room_padding = 6
-        min_padded = min_room_size + room_padding
-        safety_margin = math.ceil(min_padded / 2.0)
-
-        # Minimum simulation grid area to scatter num_rooms rooms
-        min_area = min_padded**2 * self.num_rooms
-
-        # Use current aspect ratio as target
-        aspect = self.height / max(self.width, 1)
-
-        # Compute minimum simulation grid dimensions
-        sim_cols = math.ceil(math.sqrt(min_area / max(aspect, 0.01)))
-        sim_rows = math.ceil(min_area / sim_cols)
-
-        # Physical grid = simulation grid + 2 * safety margin
-        required_width = sim_cols  # + 2 * safety_margin
-        required_height = sim_rows  # + 2 * safety_margin
-
-        self.width = max(self.width, required_width)
-        self.height = max(self.height, required_height)
-
     # --------------- Level generation (with solvable chain) ---------------
     def _generate_level(self):
-        # Resize grid if needed before attempting generation
-        # self._ensure_capacity()
 
         MAX_ATTEMPTS = 1000
         last_error = None
@@ -657,6 +839,7 @@ class RescueGridworldEnv(gym.Env):
         self.room_graph = {}
         self.cupboards.clear()
         self.people.clear()
+        self.previous_traversable_code.clear()
         self.inventory = {
             "keys": 0,
             "keycards": 0,
@@ -677,7 +860,7 @@ class RescueGridworldEnv(gym.Env):
             return False
 
         self._connect_rooms()
-        start_idx = self._place_start_exit()
+        start_idx = self._place_start_exit_fire()
         self._place_items(start_idx)
         self._place_people()
 
@@ -810,50 +993,91 @@ class RescueGridworldEnv(gym.Env):
             self.room_graph[a].append(b)
             self.room_graph[b].append(a)
 
-    def _place_start_exit(self) -> int:
+    def _get_location_in_wall(self, room_idx: int) -> tuple[int, int] | None:
+        """Returns a random location in the wall for a room or None otherwise."""
+
+        ey1, ex1, ey2, ex2 = self.rooms[room_idx]
+        # Step down the left wall.
+        for i in range(1, ey2 - ey1, 1):
+            if (
+                self.grid[ey1 + i, ex1 - 1] == WALL
+                and self.grid[ey1 + i + 1, ex1 - 1] == WALL
+                and self.grid[ey1 + i - 1, ex1 - 1] == WALL
+                and self.grid[ey1 + i, ex1] == EMPTY
+                and self.grid[ey1 + i + 1, ex1] == EMPTY
+                and self.grid[ey1 + i - 1, ex1] == EMPTY
+                and self.grid[ey1 + i, ex1 - 2] == WALL
+                and self.grid[ey1 + i + 1, ex1 - 2] == WALL
+                and self.grid[ey1 + i - 1, ex1 - 2] == WALL
+            ):
+                return (ey1 + i, ex1 - 1)
+
+        # Step down the right wall.
+        for i in range(1, ey2 - ey1, 1):
+            if (
+                self.grid[ey1 + i, ex2 + 1] == WALL
+                and self.grid[ey1 + i + 1, ex2 + 1] == WALL
+                and self.grid[ey1 + i - 1, ex2 + 1] == WALL
+                and self.grid[ey1 + i, ex2] == EMPTY
+                and self.grid[ey1 + i + 1, ex2] == EMPTY
+                and self.grid[ey1 + i - 1, ex2] == EMPTY
+                and self.grid[ey1 + i, ex2 + 2] == WALL
+                and self.grid[ey1 + i + 1, ex2 + 2] == WALL
+                and self.grid[ey1 + i - 1, ex2 + 2] == WALL
+            ):
+                return (ey1 + i, ex2 + 1)
+
+        return None
+
+    def _place_start_exit_fire(self) -> int:
+        """Place the start and exit positions in the grid and choose the start location of the fire."""
         # --- Choose start/exit rooms ---
-        start_idx = int(self._rng.integers(0, len(self.rooms)))
+        sp = None
+        start_idx = 0
+        while sp is None:
+            start_idx = int(self._rng.integers(0, len(self.rooms)))
+            sp = self._get_location_in_wall(start_idx)
+
+        self.start_pos = sp
+        self.grid[self.start_pos] = EXIT
 
         # Place the exit in a wall
+        exit_options = list(range(len(self.rooms)))
+        exit_options.remove(start_idx)
         for _ in range(100):
-            exit_set = False
-            exit_options = list(range(len(self.rooms)))
-            exit_options.remove(start_idx)
             exit_idx = random.choice(exit_options)
             assert start_idx != exit_idx, (
                 "Fatal Error: The start and finish rooms should not be the same."
             )
-
-            # Place exit
-            ey1, ex1, ey2, ex2 = self.rooms[exit_idx]
-            # Step down the left wall.
-            for i in range(1, ey2 - ey1, 1):
-                if (
-                    self.grid[ey1 + i, ex1 - 1] == WALL
-                    and self.grid[ey1 + i + 1, ex1 - 1] == WALL
-                    and self.grid[ey1 + i - 1, ex1 - 1] == WALL
-                    and self.grid[ey1 + i, ex1] == EMPTY
-                    and self.grid[ey1 + i + 1, ex1] == EMPTY
-                    and self.grid[ey1 + i - 1, ex1] == EMPTY
-                    and self.grid[ey1 + i, ex1 - 2] == WALL
-                    and self.grid[ey1 + i + 1, ex1 - 2] == WALL
-                    and self.grid[ey1 + i - 1, ex1 - 2] == WALL
-                ):
-                    self.exit_pos = (ey1 + i, ex1 - 1)
-                    # self.exit_pos = self._random_empty_in_rect((ey1+2, ex1+2, ey2-2, ex2-2))
-                    self.grid[self.exit_pos] = EXIT
-                    exit_set = True
-                    break
-            if exit_set:
-                break
+            ep = self._get_location_in_wall(exit_idx)
+            if ep is None:
+                continue
+            self.exit_pos = ep
+            self.grid[self.exit_pos] = EXIT
+            break
         else:
             assert False, (
                 "Fatal Error: Unable to place exit while creating environment."
             )
 
-        # Place agent in start room
-        sy1, sx1, sy2, sx2 = self.rooms[start_idx]
-        self.agent_pos = self._random_empty_in_rect((sy1, sx1, sy2, sx2))
+        if self.has_fire:
+            # Find the start location of the fire.
+            # We don't want the fire to start in the same room as the start or exit.
+            fire_options = list(range(len(self.rooms)))
+            fire_options.remove(start_idx)
+            fire_options.remove(exit_idx)
+            fire_idx = random.choice(fire_options)
+            fire_pos = self._random_empty_in_rect(self.rooms[fire_idx])
+            self.fire_pos = fire_pos
+            self.grid[self.fire_pos] = FIRE
+
+        # Place agent in start room next to start location
+        if self.grid[self.start_pos[0], self.start_pos[1] + 1] == EMPTY:
+            self.agent_pos = (self.start_pos[0], self.start_pos[1] + 1)
+        elif self.grid[self.start_pos[0], self.start_pos[1] - 1] == EMPTY:
+            self.agent_pos = (self.start_pos[0], self.start_pos[1] - 1)
+        else:
+            assert False, "Fatal error, unable to place agent in start room."
         self.agent_start = self.agent_pos
         return start_idx
 
@@ -1087,6 +1311,7 @@ class RescueGridworldEnv(gym.Env):
                 continue
 
             return pos, room_idx
+
         raise IndexError("Failed to place cupboard after 100 attempts.")
 
     def _place_key_in_room(self, _key_room_path: List) -> Tuple[Tuple[int, int], int]:
@@ -1116,6 +1341,7 @@ class RescueGridworldEnv(gym.Env):
                     and self._adjacent_squares_empty(pos)
                 ):
                     self.people.append(Person(pos=pos))
+                    self.previous_traversable_code.append(self.grid[pos])
                     self.grid[pos] = PERSON_TILE
                     break
             else:
@@ -1125,7 +1351,7 @@ class RescueGridworldEnv(gym.Env):
         for n in self._neighbors4(pos):
             if (
                 self.grid[n] != EMPTY
-                or n in (self.agent_pos, self.exit_pos)
+                or n in (self.agent_pos, self.exit_pos, self.start_pos)
                 or n in self.cupboards
             ):
                 return False
@@ -1179,7 +1405,7 @@ class RescueGridworldEnv(gym.Env):
         code = self.grid[y, x]
         if code in (EMPTY, KEY_TILE, EXIT, DOOR_LOCKED, DOOR_UNLOCKED):
             return True
-        return False
+        return False  # cupboards/walls are blocked for path
 
     def _bfs_path_cells(
         self, start: Tuple[int, int], goal: Tuple[int, int]
@@ -1204,8 +1430,8 @@ class RescueGridworldEnv(gym.Env):
             return []
 
         q = deque([start])
-        prev: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {start: None}
-        found: Optional[Tuple[int, int]] = None
+        prev: Dict[Tuple[int, int], Tuple[int, int]] = {start: None}
+        found: Tuple[int, int] = None
 
         while q:
             cur = q.popleft()
@@ -1221,7 +1447,7 @@ class RescueGridworldEnv(gym.Env):
             return []
 
         # Reconstruct
-        path = [found]
+        path: List[Tuple[int, int]] = [found]
         while prev[path[-1]] is not None:
             path.append(prev[path[-1]])
         path.reverse()
@@ -1252,7 +1478,7 @@ class RescueGridworldEnv(gym.Env):
         y1, x1, y2, x2 = rect
         return y1 <= y <= y2 and x1 <= x <= x2
 
-    def _random_empty_in_rect(self, rect) -> Optional[Tuple[int, int]]:
+    def _random_empty_in_rect(self, rect) -> Tuple[int, int]:
         """Checks a given rectangle of squares for an empty space, returning either a random empty location or None."""
         r1, c1, r2, c2 = rect
         empties: List[Tuple[int, int]] = []
@@ -1260,20 +1486,21 @@ class RescueGridworldEnv(gym.Env):
             for col in range(c1, c2 + 1):
                 if (
                     self.grid[row, col] == EMPTY
-                    and (row, col) not in [self.agent_pos, self.exit_pos]
+                    and (row, col)
+                    not in [self.agent_pos, self.exit_pos, self.start_pos]
                     and (row, col) not in self.cupboards
                 ):
                     empties.append((row, col))
         return random.choice(empties) if empties else None
 
-    def _random_empty_global(self) -> Tuple[int, int] | None:
+    def _random_empty_global(self) -> Tuple[int, int]:
         locs = np.argwhere(self.grid == EMPTY)
         # Filter out occupied positions
         valid_positions = []
         for l in locs:
             l = tuple(l)
             if (
-                l not in (self.agent_pos, self.exit_pos)
+                l not in (self.agent_pos, self.exit_pos, self.start_pos)
                 # not any(_a == l for _a in (self.agent_pos, self.exit_pos))
                 and l not in self.cupboards
                 and not any(p.pos == l for p in self.people)
@@ -1288,29 +1515,46 @@ class RescueGridworldEnv(gym.Env):
                 return pos
         return None
 
-    def _adjacent_of_type_with_chain_id(self, codes: set) -> Optional[Tuple[int, int]]:
-        """Check if the neighbours are of type code and we have the chain_id item we need"""
-        for row, col in self._neighbors4(self.agent_pos):
-            if self.grid[row, col] in codes:
-                if (
-                    self.grid[row, col] == CUPBOARD_LOCKED
-                    and self.cupboards[(row, col)].chain_id in self.inventory["key_ids"]
-                ):
-                    return row, col
-                if (
-                    self.grid[row, col] == DOOR_LOCKED
-                    and self.doors[(row, col)].chain_id in self.inventory["keycard_ids"]
-                ):
-                    return row, col
+    def _ahead_of_type_with_chain_id(self, codes: Set[int]) -> Tuple[int, int]:
+        offset = forward_offset[self._current_direction]
+        arow, acol = self.agent_pos
+        row, col = arow + offset[0], acol + offset[1]
+        if self.grid[row, col] in codes:
+            if (
+                self.grid[row, col] == CUPBOARD_LOCKED
+                and self.cupboards[(row, col)].chain_id in self.inventory["key_ids"]
+            ):
+                return row, col
+            if (
+                self.grid[row, col] in self.door_locked_types
+                and self.doors[(row, col)].chain_id in self.inventory["keycard_ids"]
+            ):
+                return row, col
+
+    def _ahead_of_type(self, codes: Set[int]) -> Tuple[int, int]:
+        offset = forward_offset[self._current_direction]
+        arow, acol = self.agent_pos
+        row, col = arow + offset[0], acol + offset[1]
+        if self.grid[row, col] in codes:
+            return row, col
         return None
 
-    def _adjacent_cupboard_with_keycard_unlocked(self) -> Optional[Tuple[int, int]]:
-        for row, col in self._neighbors4(self.agent_pos):
-            if self.grid[row, col] == CUPBOARD_UNLOCKED_KEYCARD:
-                c = self.cupboards.get((row, col))
-                if c and (not c.locked) and c.has_keycard:
-                    return row, col
+    def _forward_cupboard_with_keycard_unlocked(self) -> Optional[Tuple[int, int]]:
+        offset = forward_offset[self._current_direction]
+        arow, acol = self.agent_pos
+        row, col = arow + offset[0], acol + offset[1]
+        if self.grid[row, col] == CUPBOARD_UNLOCKED_KEYCARD:
+            c = self.cupboards.get((row, col))
+            if c and (not c.locked) and c.has_keycard:
+                return row, col
         return None
+
+    def _adjacent_doors(self) -> Optional[List[Tuple[int, int]]]:
+        doors = []
+        for row, col in self._neighbors4(self.agent_pos):
+            if self.grid[row, col] in self.door_types:
+                doors.append((row, col))
+        return doors if doors else None
 
     def _unlock_cupboard(self, pos: Tuple[int, int]):
         c = self.cupboards[pos]
@@ -1324,55 +1568,6 @@ class RescueGridworldEnv(gym.Env):
         dinfo = self.doors[pos]
         dinfo.locked = False
         self.grid[pos] = DOOR_UNLOCKED
-
-    def get_path(self, start, end) -> List[Tuple[int, int]]:
-        r0, c0 = start[0] + 0.5, start[1] + 0.5
-        r1, c1 = end[0] + 0.5, end[1] + 0.5
-
-        assert start != end, "Start and end are the same"
-
-        r_grad = r1 - r0
-        c_grad = c1 - c0
-
-        num_steps = max(abs(r_grad), abs(c_grad))
-        direction = (
-            "r" if abs(r_grad) >= abs(c_grad) else "c"
-        )  # Is row or column the axis to step along?
-
-        path = []
-        if direction == "r":
-            grad = abs(c_grad / r_grad)
-            for s in range(int(num_steps) + 1):
-                path.append(
-                    (
-                        int(start[0] + ((r_grad + 1e-6) / (abs(r_grad) + 1e-6)) * s),
-                        int(
-                            math.floor(
-                                c0
-                                + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6)) * (s * grad)
-                            )
-                        ),
-                    )
-                )
-        else:
-            grad = abs(r_grad / c_grad)
-            for s in range(int(num_steps) + 1):
-                path.append(
-                    (
-                        int(
-                            (
-                                math.floor(
-                                    r0
-                                    + ((r_grad + 1e-6) / (abs(r_grad) + 1e-6))
-                                    * (s * grad)
-                                )
-                            )
-                        ),
-                        int(start[1] + ((c_grad + 1e-6) / (abs(c_grad) + 1e-6)) * s),
-                    )
-                )
-
-        return path
 
     def _precompute_los_paths(
         self, window_size: int
@@ -1446,11 +1641,9 @@ class RescueGridworldEnv(gym.Env):
         if not path:  # It's the center point
             return True
 
-        # path[0] is the start point based on your original get_path logic
         prev_r, prev_c = path[0][0], path[0][1]
 
         for r, c in path[1:]:
-            # Use the O(1) set lookup
             if subgrid[r, c] not in self._passable_tiles_set and (r, c) != path[-1]:
                 return False
 
