@@ -5,7 +5,7 @@ import gymnasium as gym
 
 def run_random_agent(num_steps: int, num_episodes: int, render: bool, tile_size: int, rooms: int, people: int) -> None:
 
-    env = gym.make("RescueGridworld-v2", render_mode="human",
+    env = gym.make("RescueGridworld-v1", render_mode="human",
                    tile_size=tile_size, num_rooms=rooms, num_people=people)
 
     for episode in range(num_episodes):
