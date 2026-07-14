@@ -5,23 +5,23 @@ import gymnasium as gym
 
 def run_random_agent(num_steps: int, num_episodes: int, render: bool, tile_size: int, rooms: int, people: int) -> None:
 
-    env = gym.make("RescueGridworld-v0", render_mode="human",
+    env = gym.make("RescueGridworld-v2", render_mode="human",
                    tile_size=tile_size, num_rooms=rooms, num_people=people)
 
     for episode in range(num_episodes):
         obs, info = env.reset()
         episode_reward = 0
         print(f"--- Starting Episode {episode + 1} ---")
-        
+
         for step in range(num_steps):
             if render:
                 env.render()
-            
+
             action = env.action_space.sample()
-            
+
             obs, reward, terminated, truncated, info = env.step(action)
             episode_reward += reward
-            
+
             # The dict obs has 'grid' (uint8) and 'chain_grid' (int16)
             # You can access them like:
             grid = obs['grid']
@@ -47,5 +47,5 @@ if __name__ == "__main__":
     parser.add_argument("--people", type=int, default=30, help="Number of people.")
 
     args = parser.parse_args()
-    
+
     run_random_agent(args.steps, args.episodes, args.render, args.tilesize, args.rooms, args.people)
