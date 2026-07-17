@@ -653,10 +653,6 @@ class RescueGridworldEnv(gym.Env):
         pygame.draw.polygon(surf, (250, 250, 250), points)
         pygame.draw.polygon(surf, (0, 0, 0), points, width=2)
 
-        # rect = pygame.Rect(ax * tile, ay * tile, tile, tile)
-        # pygame.draw.circle(surf, (250, 250, 250), rect.center, tile // 3)
-        # pygame.draw.circle(surf, (0, 0, 0), rect.center, tile // 3, width=2)
-
         if self.render_mode == "human":
             # Handle events so the window stays responsive
             for event in pygame.event.get():
@@ -934,41 +930,85 @@ class RescueGridworldEnv(gym.Env):
         height, width = self.grid.shape
 
         for i, j in tree_edges:
-            (y0, x0), (y1, x1) = centers[i], centers[j]
+            (row0, col0), (row1, col1) = centers[i], centers[j]
 
-            x_step = 1 if x1 >= x0 else -1
-            y_step = 1 if y1 >= y0 else -1
+            room_i = self.rooms[i]
+            room_j = self.rooms[j]
+
+            x_step = 1 if col1 >= col0 else -1
+            y_step = 1 if row1 >= row0 else -1
 
             # --- compute elbow and push it one tile away from adjacent room if needed ---
-            elbow_y, elbow_x = y0, x1
+            elbow_row, elbow_col = row0, col1
 
             # only care when the path is actually L-shaped
-            if x0 != x1 and y0 != y1:
-                # check 4-neighbourhood for existing EMPTY (room) tiles
-                for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                    ny, nx = elbow_y + dy, elbow_x + dx
-                    if (
-                        self.grid[elbow_y, elbow_x] != EMPTY
-                        and self.grid[ny, nx] == EMPTY
-                    ):
-                        # move elbow one step *away* from that empty neighbour
-                        # print("FOUND THE PROBLEM CASE")
-                        elbow_y -= dy
-                        elbow_x -= dx
-                        # Adjust the centres to match the elbows.
-                        centers[i] = (centers[i][0] - dy, centers[i][1] - dx)
-                        centers[j] = (centers[j][0] - dy, centers[j][1] - dx)
+            if col0 != col1 and row0 != row1:
+                # Check for corridor collisions with other rooms.
+                jr_step = 1 if row0 > row1 else -1
+                jc_step = 1 if col0 > col1 else -1
+                ir_step = 1 if row1 > row0 else -1
+                ic_step = 1 if col1 > col0 else -1
+                for count in range(20):
+                    collision_j = self._collision_check((elbow_row, elbow_col, row1, col1), i, j)
+                    collision_i = self._collision_check((elbow_row, elbow_col, row0, col0), i, j)
+
+                    if not collision_j and not collision_i and count > 0:  # Do 1 full pass
                         break
 
-            elbow = (elbow_y, elbow_x)
+                    # Move the colliding corridor sideways
+                    if collision_j:
+                        if elbow_row == row1:
+                            # If j's line is horizontal and i is further down than j, move j's line down, otherwise up.
+                            elbow_row = row1 = np.clip(row1 + jr_step, room_j[0]+1, room_j[2]-1)
+
+                        elif elbow_col == col1:
+                            # If j's line is vertical and i is further right than j, move j's line right, otherwise left.
+                            elbow_col = col1 = np.clip(col1 + jc_step, room_j[1]+1, room_j[3]-1)
+
+                    if collision_i:
+                        if elbow_row == row0:
+                            # If i's line is horizontal and j is further down than i, move i's line down, otherwise up.
+                            elbow_row = row0 = np.clip(row0 + ir_step, room_i[0]+1, room_i[2]-1)
+
+                        elif elbow_col == col0:
+                            # If i's line is vertical and j is further right than i, move i's line right, otherwise left.
+                            elbow_col = col0 = np.clip(col0 + ic_step, room_i[1]+1, room_i[3]-1)
+
+                    # Move a bit further if we are now up against the wall of the room
+                    if elbow_row == room_j[0] - 1:
+                        elbow_row = row0 = room_j[0] + 1
+                    elif elbow_row == room_j[2] + 1:
+                        elbow_row = row0 = room_j[2] - 1
+                    if elbow_col == room_j[1] - 1:
+                        elbow_col = col0 = room_j[1] + 1
+                    elif elbow_col == room_j[3] + 1:
+                        elbow_col = col0 = room_j[3] - 1
+                    if elbow_row == room_i[0] - 1:
+                        elbow_row = row1 = room_i[0] + 1
+                    elif elbow_row == room_i[2] + 1:
+                        elbow_row = row1 = room_i[2] - 1
+                    if elbow_col == room_i[1] - 1:
+                        elbow_col = col1 = room_i[1] + 1
+                    elif elbow_col == room_i[3] + 1:
+                        elbow_col = col1 = room_i[3] - 1
+
+                else:
+                    print(f"Failed to create corridor between {i} and {j}")
+                    exit(1)
+
+                # Adjust the corridor dimensions.
+                centers[i] = (row0, col0)
+                centers[j] = (row1, col1)
+
+            elbow = (elbow_row, elbow_col)
             corridor_elbows[(i, j)] = elbow
             corridor_elbows[(j, i)] = elbow
-            (y0, x0), (y1, x1) = centers[i], centers[j]
+            (row0, col0), (row1, col1) = centers[i], centers[j]
             # --- carve corridor exactly as before (from center to center) ---
-            for x in range(x0, x1 + x_step, x_step):
-                self.grid[y0, x] = EMPTY
-            for y in range(y0, y1 + y_step, y_step):
-                self.grid[y, x1] = EMPTY
+            for x in range(col0, col1 + x_step, x_step):
+                self.grid[row0, x] = EMPTY
+            for y in range(row0, row1 + y_step, y_step):
+                self.grid[y, col1] = EMPTY
 
             # --- doors use the *adjusted* elbow ---
             door_i = self._boundary_door_position(centers[i], elbow)
@@ -992,6 +1032,25 @@ class RescueGridworldEnv(gym.Env):
         for a, b in tree_edges:
             self.room_graph[a].append(b)
             self.room_graph[b].append(a)
+
+    def _collision_check(self, line: Tuple, start_room_idx: int, end_room_idx: int) -> bool:
+        """Check if the corridor segment intersects with any other room's boundary."""
+        lr0, lc0, lr1, lc1 = line
+        for i in range(len(self.rooms)):
+            if i == start_room_idx or i == end_room_idx:
+                continue
+            r0, c0, r1, c1 = self.rooms[i]
+            r0e = r0 - 3
+            c0e = c0 - 3
+            r1e = r1 + 3
+            c1e = c1 + 3
+
+            for line_row in range(lr0 if lr0 <= lr1 else lr1, (lr1 if lr0 <= lr1 else lr0) + 1):
+                for line_col in range(lc0 if lc0 <= lc1 else lc1, (lc1 if lc0 <= lc1 else lc0) + 1):
+                    # if (r0 <= line_row <= r1 and c0 <= line_col <= c1):
+                    if (r0e <= line_row <= r1e and c0 <= line_col <= c1) or (r0 <= line_row <= r1 and c0e <= line_col <= c1e):
+                        return True
+        return False
 
     def _get_location_in_wall(self, room_idx: int) -> tuple[int, int] | None:
         """Returns a random location in the wall for a room or None otherwise."""
